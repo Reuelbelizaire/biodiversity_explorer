@@ -42,6 +42,31 @@ def generate_conservation_report(species_name: str, stats: dict) -> str:
     )
     return response.choices[0].message.content
 
+def answer_animal_question(species_name: str, question: str, context_stats: dict) -> str:
+    """Answers user-submitted questions about a species using DeepSeek."""
+    client = _get_client()
+    prompt = f"""
+    You are an expert wildlife biologist and ecological educator.
+    The user is asking a question about {species_name}.
+    
+    Here is our current database context for this species:
+    - Verified Sightings in Database: {context_stats.get('total_count', 'N/A')}
+    - Top Observation Regions: {context_stats.get('top_countries', 'N/A')}
+    
+    User Question: {question}
+    
+    Provide an accurate, engaging, and concise response (1-2 short paragraphs).
+    """
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "You are a knowledgeable, engaging wildlife biologist."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
+    )
+    return response.choices[0].message.content
+
 if __name__ == "__main__":
     print("Testing DeepSeek API handshake...")
     test_stats = {

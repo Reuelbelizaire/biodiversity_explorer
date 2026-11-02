@@ -1,42 +1,78 @@
 import requests
 
-def fetch_species_occurrences(scientific_name: str, limit: int = 100) -> list[dict]:
+def fetch_species_occurrences(scientific_name: str, limit: int = 150) -> list[dict]:
     """
-    Fetches animal occurrence records from the GBIF API and cleans the output.
+    Fetches raw occurrence data from the GBIF REST API for a given species,
+    cleans missing coordinates, and standardizes field names.
     """
-    url = "https://api.gbif.org/v1/occurrence/search"
+    endpoint = "https://api.gbif.org/v1/occurrence/search"
     params = {
         "scientificName": scientific_name,
         "hasCoordinate": "true",
+        "hasGeospatialIssue": "false",
         "limit": limit
     }
     
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()  # Raises error if request failed
-    
-    data = response.json()
-    raw_results = data.get("results", [])
-    
+    try:
+        response = requests.get(endpoint, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        raw_results = data.get("results", [])
+    except Exception as e:
+        print(f"Error fetching from GBIF API: {e}")
+        return []
+
     cleaned_records = []
     for item in raw_results:
+        # Standardize and map directly to Supabase schema
         cleaned_records.append({
             "occurrence_id": str(item.get("key")),
-            "scientific_name": item.get("scientificName", scientific_name),
+            "scientific_name": scientific_name,  # Clean canonical name without author tags
             "country": item.get("country", "Unknown"),
             "latitude": item.get("decimalLatitude"),
             "longitude": item.get("decimalLongitude"),
             "event_date": item.get("eventDate"),
             "basis_of_record": item.get("basisOfRecord")
         })
-        
+
     return cleaned_records
 
-if __name__ == "__main__":
-    # Test fetch for Cheetah (Acinonyx jubatus)
-    test_animal = "Acinonyx jubatus"
-    print(f"Fetching sightings for {test_animal}...")
-    records = fetch_species_occurrences(test_animal, limit=5)
+
+def resolve_species_name(query_name: str) -> dict | None:
+    """
+    Resolves common or scientific names via GBIF Taxonomy & Suggest APIs.
+    """
+    cleaned_query = query_name.strip()
     
-    print(f"Successfully fetched {len(records)} records!\n")
-    for r in records:
-        print(r)
+    # 1. First attempt: Standard scientific / taxonomic matcher
+    match_url = f"https://api.gbif.org/v1/species/match?verbose=false&name={cleaned_query}"
+    try:
+        res = requests.get(match_url, timeout=5).json()
+        match_type = res.get("matchType")
+        if match_type in ["EXACT", "FUZZY"] and res.get("confidence", 0) > 60:
+            return {
+                "scientific_name": res.get("species") or res.get("scientificName"),
+                "canonical_name": res.get("canonicalName") or res.get("species"),
+                "family": res.get("family", "Unknown"),
+                "taxon_key": res.get("usageKey")
+            }
+    except Exception as e:
+        print(f"Error in GBIF species match: {e}")
+
+    # 2. Fallback: Search endpoint (resolves vernacular / common names like 'Jaguar')
+    suggest_url = f"https://api.gbif.org/v1/species/suggest?q={cleaned_query}&limit=5"
+    try:
+        suggestions = requests.get(suggest_url, timeout=5).json()
+        for item in suggestions:
+            # Look for species-rank results
+            if item.get("rank") == "SPECIES" and item.get("canonicalName"):
+                return {
+                    "scientific_name": item.get("canonicalName"),
+                    "canonical_name": item.get("canonicalName"),
+                    "family": item.get("family", "Unknown"),
+                    "taxon_key": item.get("key")
+                }
+    except Exception as e:
+        print(f"Error in GBIF species suggest: {e}")
+
+    return None

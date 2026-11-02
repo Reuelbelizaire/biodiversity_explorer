@@ -29,12 +29,10 @@ def upsert_occurrences(records: list[dict]):
     return response.data
 
 def fetch_occurrences_by_species(scientific_name: str) -> list[dict]:
-    """
-    Queries stored sightings for an animal from Supabase.
-    """
+    """Queries stored sightings for an animal from Supabase."""
     response = supabase.table("occurrences")\
         .select("*")\
-        .eq("scientific_name", scientific_name)\
+        .ilike("scientific_name", f"%{scientific_name}%")\
         .execute()
     return response.data
 

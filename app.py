@@ -1,450 +1,377 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 
-# Page Config (must be the first Streamlit call in the script)
-st.set_page_config(page_title="WildTrack | Species Analytics", layout="wide", page_icon="🌿")
+from gbif_client import fetch_species_occurrences, resolve_species_name
+from db_loader import upsert_occurrences, fetch_occurrences_by_species
+from llm_service import generate_conservation_report, answer_animal_question
+# Page Configuration
+st.set_page_config(page_title="WildTrack | Biodiversity Explorer", layout="wide", page_icon="🌿")
 
-# Local modules are imported *after* set_page_config so that a broken or stale
-# import can be reported in the UI instead of dumping a traceback on every rerun.
-try:
-    from gbif_client import fetch_species_occurrences
-    from db_loader import (
-        upsert_occurrences,
-        fetch_occurrences_by_species,
-        fetch_occurrences_by_species_list,
-    )
-    from llm_service import generate_conservation_report
-except ImportError as exc:
-    st.error(f"**The app could not load its own modules:** `{exc}`")
-    if "fetch_occurrences_by_species_list" in str(exc):
-        st.info(
-            "`db_loader.py` on disk defines this function, but the running Streamlit "
-            "process is still holding the copy it imported at startup. Stop the server "
-            "(Ctrl+C in its terminal) and start it again with `streamlit run app.py`."
-        )
-    else:
-        st.info(
-            "A dependency is missing. Run `pip install -r requirements.txt` in the "
-            "environment that launches Streamlit, then restart the server."
-        )
-    st.stop()
-
-
-# Custom CSS for the Dark Forest Green Aesthetic
+# --- Frosted Glass & Light Mint Styling ---
 st.markdown("""
 <style>
-    /* Clean, soft modern background */
+    /* Smooth Transitions & Ambient Background */
     .stApp {
-        background: radial-gradient(circle at top left, #f4fbf7, #e8f5ee, #daf0e4);
+        background: radial-gradient(circle at 10% 20%, #f4fbf7 0%, #e8f5ee 50%, #dff2e7 100%);
         color: #1a382b;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
 
-    /* Igloo-style Frosted Glass Card */
-    .metric-card {
-        background: rgba(255, 255, 255, 0.75);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        border: 1px solid rgba(134, 239, 172, 0.4);
+    /* Interactive Frosted Glass Cards */
+    .glass-card {
+        background: rgba(255, 255, 255, 0.65);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid rgba(110, 231, 183, 0.4);
         border-radius: 20px;
-        padding: 22px;
-        box-shadow: 0 10px 30px rgba(16, 185, 129, 0.08);
-        transition: transform 0.2s ease;
+        padding: 20px 24px;
+        box-shadow: 0 8px 32px 0 rgba(16, 185, 129, 0.06);
+        transition: transform 0.25s ease, box-shadow 0.25s ease;
     }
-    .metric-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 14px 35px rgba(16, 185, 129, 0.14);
+    .glass-card:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 12px 36px 0 rgba(16, 185, 129, 0.12);
+        border-color: rgba(5, 150, 105, 0.4);
     }
 
-    /* Vibrant Mint Badges */
+    /* Glowing Badge */
     .pill-badge {
-        background: #d1fae5;
+        background: linear-gradient(135deg, #d1fae5, #a7f3d0);
         border: 1px solid #6ee7b7;
         color: #065f46;
-        border-radius: 50px;
+        border-radius: 9999px;
         padding: 4px 14px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        display: inline-block;
-    }
-
-    .metric-title {
-        color: #4b7a64;
-        font-size: 0.85rem;
-        font-weight: 600;
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
         text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-top: 8px;
-    }
-    .metric-val {
-        color: #064e3b;
-        font-size: 2.2rem;
-        font-weight: 800;
-    }
-
-    /* Tab Styling */
-    button[data-baseweb="tab"] {
-        border-radius: 12px;
-        padding: 8px 16px;
-        color: #065f46;
-        font-weight: 600;
+        display: inline-block;
+        box-shadow: 0 2px 8px rgba(16, 185, 129, 0.15);
     }
 </style>
 """, unsafe_allow_html=True)
-# Species Directory
-species_options = {
-    "Cheetah (Acinonyx jubatus)": "Acinonyx jubatus",
-    "Emperor Penguin (Aptenodytes forsteri)": "Aptenodytes forsteri",
-    "Peregrine Falcon (Falco peregrinus)": "Falco peregrinus",
-    "Giraffe (Giraffa camelopardalis)": "Giraffa camelopardalis"
+# Species Lookup Directory
+SPECIES_CATALOG = {
+    "Cheetah": "Acinonyx jubatus",
+    "Emperor Penguin": "Aptenodytes forsteri",
+    "Peregrine Falcon": "Falco peregrinus",
+    "Giraffe": "Giraffa camelopardalis",
+    "Blue Whale": "Balaenoptera musculus",
+    "Snow Leopard": "Panthera uncia",
+    "Bald Eagle": "Haliaeetus leucocephalus",
+    "Polar Bear": "Ursus maritimus",
+    "African Elephant": "Loxodonta africana",
+    "Koala": "Phascolarctos cinereus",
+    "Tiger": "Panthera tigris",
+    "Monarch Butterfly": "Danaus plexippus",
+    "Loggerhead Sea Turtle": "Caretta caretta"
 }
 
-# --- Map helpers -------------------------------------------------------------
-# A fixed palette keeps every species the same colour on every rerun, no matter
-# in which order Supabase returns the rows.
-SPECIES_COLORS = {
-    "Acinonyx jubatus": "#4ade80",        # cheetah - mint
-    "Aptenodytes forsteri": "#38bdf8",    # emperor penguin - ice blue
-    "Falco peregrinus": "#fbbf24",        # peregrine falcon - amber
-    "Giraffa camelopardalis": "#f472b6",  # giraffe - rose
-}
-FALLBACK_COLORS = ["#a78bfa", "#fb7185", "#2dd4bf", "#f97316", "#c084fc", "#eab308"]
+# --- Sidebar: Ingestion & Filter Controls ---
+st.sidebar.markdown("<div class='pill-badge'>🌿 Control Station</div>", unsafe_allow_html=True)
+st.sidebar.header("Data Management")
 
-# Scientific name -> short label used inside the hover card
-COMMON_NAMES = {
-    "Acinonyx jubatus": "Cheetah",
-    "Aptenodytes forsteri": "Emperor Penguin",
-    "Falco peregrinus": "Peregrine Falcon",
-    "Giraffa camelopardalis": "Giraffe",
-}
+# Ingestion Section: Dynamic Search + Catalog Fallback
+search_query = st.sidebar.text_input("🔍 Search Any Animal:", placeholder="e.g., Squirrel, Bald Eagle, Caretta caretta")
+fetch_count = st.sidebar.slider("Number of records to fetch:", min_value=50, max_value=300, value=150, step=25)
 
-# Hover card layout. %{customdata[i]} reads the columns built in
-# build_sighting_map(); <extra></extra> hides Plotly's default trace-name box.
-HOVER_TEMPLATE = (
-    "<b>%{customdata[0]}</b>"
-    "<br><span style='color:#8fd6b4; font-size:11px'>%{customdata[1]}</span>"
-    "<br><br>📅  %{customdata[2]}"
-    "<br>🌍  %{customdata[3]}"
-    "<extra></extra>"
-)
+target_ingest_label = None
+ingest_scientific = None
 
+if search_query.strip():
+    with st.spinner("Resolving taxonomy with GBIF..."):
+        match_info = resolve_species_name(search_query)
+        if match_info:
+            target_ingest_label = match_info["canonical_name"]
+            ingest_scientific = match_info["canonical_name"]
+            st.sidebar.success(f"✓ Matched: **{target_ingest_label}** ({match_info['family']})")
+            
+            # Automatically add to directory so it can be selected in display filters
+            if target_ingest_label not in SPECIES_CATALOG:
+                SPECIES_CATALOG[target_ingest_label] = ingest_scientific
+        else:
+            st.sidebar.error("Species not found or unsupported by GBIF API.")
+else:
+    target_ingest_label = st.sidebar.selectbox("Or choose from catalog:", list(SPECIES_CATALOG.keys()))
+    ingest_scientific = SPECIES_CATALOG[target_ingest_label]
 
-def _prepare_map_frame(records: list[dict]) -> pd.DataFrame:
-    """Normalise coordinates, dates and display labels for the map."""
-    frame = pd.DataFrame(records or [])
-    if frame.empty:
-        return frame
-
-    frame["latitude"] = pd.to_numeric(frame["latitude"], errors="coerce")
-    frame["longitude"] = pd.to_numeric(frame["longitude"], errors="coerce")
-    frame = frame.dropna(subset=["latitude", "longitude"])
-    # Guard against junk coordinates, which would otherwise wreck the fit.
-    frame = frame[
-        frame["latitude"].between(-90, 90) & frame["longitude"].between(-180, 180)
-    ].copy()
-    if frame.empty:
-        return frame
-
-    observed = pd.to_datetime(frame["event_date"], errors="coerce", format="mixed", utc=True)
-    frame["date_label"] = observed.dt.strftime("%d %b %Y").fillna("date not recorded")
-    frame["country_label"] = (
-        frame["country"].fillna("Unknown country").replace("", "Unknown country").astype(str)
-    )
-    frame["common_name"] = (
-        frame["scientific_name"].map(COMMON_NAMES).fillna(frame["scientific_name"]).astype(str)
-    )
-    return frame.reset_index(drop=True)
-
-
-def _padded_span(low: float, high: float, min_span: float, pad: float,
-                 floor: float, ceiling: float) -> list[float]:
-    """Widen a [low, high] span so dots never sit on the map edge."""
-    span = high - low
-    if span < min_span:  # a single point (or a tight cluster) must not zoom to max
-        middle = (low + high) / 2.0
-        low, high = middle - min_span / 2.0, middle + min_span / 2.0
-        span = min_span
-    margin = min(span * pad, 20.0)  # cap so a near-global spread is not padded in vain
-    return [max(low - margin, floor), min(high + margin, ceiling)]
-
-
-def _fit_ranges(frame: pd.DataFrame, pad: float = 0.18,
-                min_span: float = 6.0) -> tuple[list[float], list[float] | None]:
-    """Padded lat/lon windows that contain every dot, or (lat, None) if global."""
-    lat_low, lat_high = float(frame["latitude"].min()), float(frame["latitude"].max())
-    lon_low, lon_high = float(frame["longitude"].min()), float(frame["longitude"].max())
-
-    lat_range = _padded_span(lat_low, lat_high, min_span, pad, -90.0, 90.0)
-    # A ~360 degree spread (circumpolar species) cannot be padded without leaving
-    # valid coordinates, so hand framing back to Plotly's own fitter.
-    if lon_high - lon_low >= 350.0:
-        return lat_range, None
-    return lat_range, _padded_span(lon_low, lon_high, min_span, pad, -180.0, 180.0)
-
-
-def build_sighting_map(frame: pd.DataFrame, *, color_by_species: bool = True) -> go.Figure:
-    """Global sighting map: one colour per species, auto-fit bounds, hover card."""
-    hover_columns = ["common_name", "scientific_name", "date_label", "country_label"]
-
-    color_kwargs = {"color_discrete_sequence": ["#4ade80"]}
-    if color_by_species:
-        species = list(dict.fromkeys(frame["scientific_name"].astype(str)))
-        color_kwargs = {
-            "color": "scientific_name",
-            "color_discrete_map": {
-                name: SPECIES_COLORS.get(name, FALLBACK_COLORS[i % len(FALLBACK_COLORS)])
-                for i, name in enumerate(species)
-            },
-        }
-
-    fig = px.scatter_geo(
-        frame,
-        lat="latitude",
-        lon="longitude",
-        projection="natural earth",
-        **color_kwargs,
-    )
-
-    fig.update_traces(
-        # customdata is set through the trace (not the px kwarg) so the block works
-        # on both plotly 5.x and 6+/7, where the px kwarg was renamed.
-        customdata=frame[hover_columns].to_numpy(),
-        marker=dict(size=11, opacity=0.92, line=dict(width=1.1, color="rgba(9,21,16,0.85)")),
-        hovertemplate=HOVER_TEMPLATE,
-        hoverlabel=dict(
-            bgcolor="#0e231b",
-            bordercolor="#4ade80",
-            font=dict(color="#eafff5", size=13, family="Segoe UI, Helvetica, sans-serif"),
-            align="left",
-        ),
-    )
-
-    fig.update_geos(
-        bgcolor="#0e231b",
-        showland=True, landcolor="#17382b",
-        showocean=True, oceancolor="#091510",
-        showlakes=True, lakecolor="#091510",
-        showcountries=True, countrycolor="#2b5944",
-        showcoastlines=True, coastlinecolor="#2b5944",
-        showframe=False,
-        lataxis=dict(showgrid=False),
-        lonaxis=dict(showgrid=False),
-    )
-
-    lat_range, lon_range = _fit_ranges(frame)
-    if lon_range is None:
-        fig.update_geos(fitbounds="locations")  # Plotly handles the wrap-around
-    else:
-        fig.update_geos(lataxis_range=lat_range, lonaxis_range=lon_range)
-
-    if color_by_species:
-        fig.update_layout(
-            legend=dict(
-                title=dict(text="Species"),
-                bgcolor="rgba(9,21,16,0.55)",
-                bordercolor="#2b5944",
-                borderwidth=1,
-                font=dict(color="#d1fae5", size=12),
-            )
-        )
-
-    # Fill the Streamlit container so the map is never clipped by the frame.
-    fig.update_layout(height=620, margin=dict(l=0, r=0, t=8, b=0))
-    return fig
-
-# --- Sidebar Controls ---
-st.sidebar.markdown("<div class='top-badge'>🌿 Control Center</div>", unsafe_allow_html=True)
-st.sidebar.header("Data Ingestion")
-selected_label = st.sidebar.selectbox("Choose Target Species", list(species_options.keys()))
-scientific_name = species_options[selected_label]
-record_limit = st.sidebar.slider("Records to Fetch", min_value=50, max_value=300, value=150, step=25)
-map_scope = st.sidebar.radio(
-    "Map Scope",
-    ["Selected species", "All stored species"],
-    help="'All stored species' feeds the map every species in Supabase and colours the dots by species.",
-)
-
-if st.sidebar.button("Ingest GBIF Records to Supabase", width="stretch"):
-    with st.spinner(f"Harvesting sightings for {selected_label}..."):
-        try:
-            new_data = fetch_species_occurrences(scientific_name, limit=record_limit)
-            if new_data:
-                upsert_occurrences(new_data)
-                st.sidebar.success(f"Added {len(new_data)} observations to Supabase!")
+if st.sidebar.button("Ingest from GBIF to Supabase", use_container_width=True):
+    if ingest_scientific:
+        with st.spinner(f"Querying GBIF API for {target_ingest_label}..."):
+            new_records = fetch_species_occurrences(ingest_scientific, limit=fetch_count)
+            if new_records:
+                upsert_occurrences(new_records)
+                st.sidebar.success(f"Saved {len(new_records)} sightings into Supabase!")
+                st.rerun()
             else:
-                st.sidebar.warning("No records returned with valid coordinates.")
-        except Exception as exc:
-            st.sidebar.error(f"Ingestion failed: {exc}")
+                st.sidebar.warning("No records found with valid GPS coordinates.")
+    else:
+        st.sidebar.warning("Please enter a valid animal name first.")
 
-# Load Active Records from Supabase
-records = fetch_occurrences_by_species(scientific_name)
+st.sidebar.write("---")
+st.sidebar.subheader("Map & View Filters")
 
-# The map can either follow the sidebar selection or show every species at once.
-map_records = (
-    fetch_occurrences_by_species_list(list(species_options.values()))
-    if map_scope == "All stored species"
-    else records
+# Fall back to the first available catalog species if target_ingest_label is None or not found
+catalog_options = list(SPECIES_CATALOG.keys())
+safe_default = [target_ingest_label] if target_ingest_label in catalog_options else [catalog_options[0]]
+
+selected_species_labels = st.sidebar.multiselect(
+    "Active Species on Display:",
+    options=catalog_options,
+    default=safe_default
 )
-map_df = _prepare_map_frame(map_records)
 
-# --- Top Header ---
-st.markdown("<div class='top-badge'>🐾 Conservation Intelligence & Spatial Monitoring</div>", unsafe_allow_html=True)
-st.title(f"Field Dashboard: {selected_label.split('(')[0].strip()}")
+# --- Data Loading ---
+all_records = []
+for label in selected_species_labels:
+    sci_name = SPECIES_CATALOG[label]
+    species_data = fetch_occurrences_by_species(sci_name)
+    for row in species_data:
+        row["common_name"] = label
+        all_records.append(row)
 
-# Same cleaning as the map: numeric coordinates, parsed dates, display labels.
-df = _prepare_map_frame(records)
-has_records = not df.empty
-has_map = not map_df.empty
+# Header Section
+st.markdown("<div class='pill-badge'>🐾 Global Wildlife & Migration Intelligence</div>", unsafe_allow_html=True)
+st.title("Biodiversity Analytics Studio")
 
-countries = df["country"].dropna() if has_records else pd.Series(dtype="object")
-countries = countries[countries.astype(str).str.strip() != ""]
-total_sightings = len(df)
-unique_countries = countries.nunique()
-top_country = countries.value_counts().index[0] if not countries.empty else "N/A"
+if all_records:
+    df = pd.DataFrame(all_records)
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    df = df.dropna(subset=["latitude", "longitude"])
 
-if has_records or has_map:
-    if not has_records:
-        st.info(
-            f"No stored records for **{selected_label.split('(')[0].strip()}** yet. "
-            "Ingest it from the sidebar, or switch **Map Scope** to 'All stored species'."
-        )
-
-    # --- KPI Card Row ---
-    c1, c2, c3 = st.columns(3)
-    with c1:
+    # High-Level Metric Ribbon
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
         st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Total Verified Sightings</div>
-            <div class="metric-val">{total_sightings:,}</div>
-            <div class="pill-badge">Active In Supabase</div>
+        <div class="glass-card">
+            <div class="kpi-title">Active Sightings</div>
+            <div class="kpi-value">{len(df):,}</div>
         </div>
         """, unsafe_allow_html=True)
-    with c2:
+    with k2:
         st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Nations Covered</div>
-            <div class="metric-val">{unique_countries}</div>
-            <div class="pill-badge">Geospatial Reach</div>
+        <div class="glass-card">
+            <div class="kpi-title">Species Displayed</div>
+            <div class="kpi-value">{df['common_name'].nunique()}</div>
         </div>
         """, unsafe_allow_html=True)
-    with c3:
+    with k3:
         st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Primary Stronghold</div>
-            <div class="metric-val">{top_country}</div>
-            <div class="pill-badge">Highest Density</div>
+        <div class="glass-card">
+            <div class="kpi-title">Countries Covered</div>
+            <div class="kpi-value">{df['country'].nunique()}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with k4:
+        top_nation = df['country'].value_counts().index[0] if not df['country'].empty else "N/A"
+        st.markdown(f"""
+        <div class="glass-card">
+            <div class="kpi-title">Top Hotspot</div>
+            <div class="kpi-value" style="font-size: 1.4rem;">{top_nation}</div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.write("")
+    # --- Multi-Tab Interface ---
+    tab_map, tab_analytics, tab_llm = st.tabs([
+        "🗺️ Geospatial Studio", 
+        "📊 Interactive Chart Studio", 
+        "🤖 AI Conservation Brief"
+    ])
 
-    # --- Interactive Visualization Studio (Your Chart & Metric Selector) ---
-    st.markdown("### 📊 Interactive Visual Analytics Studio")
-
-    studio_col1, studio_col2 = st.columns([1, 1])
-    with studio_col1:
-        metric_choice = st.selectbox(
-            "Select Data Dimension",
-            ["Geographic Coordinates (Global Occurrence)", "Country Distribution", "Observation Protocols (Basis of Record)"]
-        )
-    with studio_col2:
-        chart_type = st.selectbox(
-            "Select Chart Representation",
-            ["Natural Earth Map", "Bar Breakdown", "Sunburst / Donut Ring"]
-        )
-
-    # Plotly custom green theme helper
-    def apply_green_theme(fig, margin=None):
+    # Plotly transparent styling helper
+    def style_plotly_chart(fig):
         fig.update_layout(
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#d1fae5"),
-            margin=margin or dict(l=20, r=20, t=40, b=20)
+            font=dict(color="#1a382b", family="sans-serif"),
+            margin=dict(l=10, r=10, t=35, b=10)
         )
         return fig
 
-    # Render selected chart
-    chart_col, ai_col = st.columns([3, 2])
+##WORK IN PROGRESS
+# TAB 1: Global Map with Cumulative Progressive Playback
+    with tab_map:
+        st.subheader("Global Species Distribution & Progressive Timeline")
 
-    with chart_col:
-        if "Map" in chart_type:
-            if map_df.empty:
-                st.info("No records with usable coordinates yet — ingest more sightings to populate the map.")
-            else:
-                species_count = map_df["scientific_name"].nunique()
-                fig = build_sighting_map(map_df, color_by_species=species_count > 1)
-                st.plotly_chart(
-                    apply_green_theme(fig, margin=dict(l=0, r=0, t=8, b=0)),
-                    width="stretch",
+        # 1. Parse and validate dates
+        map_df = df.copy()
+        map_df["parsed_date"] = pd.to_datetime(map_df["event_date"], errors="coerce")
+        temporal_df = map_df.dropna(subset=["parsed_date"]).copy()
+
+        # 2. Extract year (or 'year_month' if you want tighter monthly increments)
+        temporal_df["timeline_step"] = temporal_df["parsed_date"].dt.year.astype(int)
+
+        # Build progressive cumulative frames
+        if not temporal_df.empty and temporal_df["timeline_step"].nunique() > 1:
+            min_step = temporal_df["timeline_step"].min()
+            max_step = temporal_df["timeline_step"].max()
+            
+            # Generate a continuous sequence including any empty intervening years
+            all_steps = list(range(min_step, max_step + 1))
+
+            cumulative_rows = []
+            for current_step in all_steps:
+                # Keep all observations recorded up to the current timeline step
+                subset = temporal_df[temporal_df["timeline_step"] <= current_step].copy()
+                if not subset.empty:
+                    subset["animation_frame"] = str(current_step)
+                    cumulative_rows.append(subset)
+
+            if cumulative_rows:
+                anim_df = pd.concat(cumulative_rows, ignore_index=True)
+                anim_df = anim_df.sort_values(["animation_frame", "common_name"])
+
+                fig_map = px.scatter_geo(
+                    anim_df,
+                    lat="latitude",
+                    lon="longitude",
+                    color="common_name",
+                    hover_name="common_name",
+                    hover_data={"country": True, "event_date": True, "latitude": False, "longitude": False},
+                    animation_frame="animation_frame",
+                    projection="natural earth",
+                    color_discrete_sequence=["#059669", "#0284c7", "#d97706", "#7c3aed", "#e11d48", "#10b981"]
                 )
-                caption = f"{len(map_df):,} sightings · {species_count} species mapped"
-                if species_count == 1 and map_scope == "Selected species":
-                    caption += " · switch Map Scope to 'All stored species' to compare species"
-                st.caption(caption)
+            else:
+                anim_df = None
+        else:
+            anim_df = None
 
-        elif not has_records:
-            st.info("Ingest sightings for this species to populate this chart.")
-        elif "Bar" in chart_type:
-            target_col = "country" if "Country" in metric_choice else "basis_of_record"
-            counts = df[target_col].value_counts().reset_index()
-            counts.columns = [target_col, "count"]
-
-            fig = px.bar(
-                counts.head(10),
-                x=target_col,
-                y="count",
-                color="count",
-                color_continuous_scale=["#17382b", "#4ade80"]
-            )
-            st.plotly_chart(apply_green_theme(fig), width="stretch")
-
-        elif "Sunburst" in chart_type or "Donut" in chart_type:
-            target_col = "country" if "Country" in metric_choice else "basis_of_record"
-            fig = px.pie(
+        # Fallback to static scatter map if insufficient time-series spread exists
+        if anim_df is None:
+            fig_map = px.scatter_geo(
                 df,
-                names=target_col,
-                hole=0.45,
-                color_discrete_sequence=["#1f4e3b", "#2e7d59", "#4ade80", "#86efac", "#a7f3d0"]
+                lat="latitude",
+                lon="longitude",
+                color="common_name",
+                hover_name="common_name",
+                hover_data={"country": True, "event_date": True, "latitude": False, "longitude": False},
+                projection="natural earth",
+                color_discrete_sequence=["#059669", "#0284c7", "#d97706", "#7c3aed", "#e11d48", "#10b981"]
             )
-            st.plotly_chart(apply_green_theme(fig), width="stretch")
 
-    # --- AI Briefing Panel ---
-    with ai_col:
-        st.markdown(f"""
-        <div class="metric-card">
-            <h4 style="color:#6ee7b7; margin-top:0;">🤖 wildlife educator Conservation Brief</h4>
-            <p style="color:#cbd5e1; font-size:0.85rem;">Synthesize regional sightings into structured conservation intelligence.</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-        clicked = st.button(
-            "Generate AI Assessment",
-            width="stretch",
-            disabled=not has_records,
-            help=None if has_records else "Ingest sightings for this species first.",
+        # Styling
+        fig_map.update_geos(
+            bgcolor="rgba(0,0,0,0)",
+            showland=True, landcolor="#e7f4ed",
+            showocean=True, oceancolor="#f0f9f5",
+            showlakes=True, lakecolor="#f0f9f5",
+            showcountries=True, countrycolor="#c2e5d3"
         )
-        if clicked:
-            top_3 = ", ".join(countries.value_counts().head(3).index.tolist()) or "N/A"
-            observed = pd.to_datetime(df["event_date"], errors="coerce").dropna()
-            first_year = observed.min().strftime("%Y") if not observed.empty else "N/A"
-            summary_payload = {
-                "total_count": total_sightings,
-                "top_countries": top_3,
-                "date_range": f"{first_year} - present",
+
+        fig_map.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#1a382b", family="sans-serif"),
+            margin=dict(l=10, r=10, t=35, b=10)
+        )
+
+        st.plotly_chart(fig_map, use_container_width=True)
+    # TAB 2: Dynamic Chart Picker
+    with tab_analytics:
+        st.subheader("Custom Analytics Studio")
+        
+        c_spec, c_metric, c_chart = st.columns(3)
+        with c_spec:
+            spec_focus = st.selectbox("Focus Species", ["All Active"] + list(df["common_name"].unique()))
+        with c_metric:
+            metric_target = st.selectbox("Data Dimension", ["Country Distribution", "Observation Protocols (Basis)"])
+        with c_chart:
+            chart_style = st.selectbox("Chart Style", ["Horizontal Bar Chart", "Donut Breakdown", "Treemap"])
+
+        chart_df = df if spec_focus == "All Active" else df[df["common_name"] == spec_focus]
+        col_name = "country" if "Country" in metric_target else "basis_of_record"
+
+        if not chart_df.empty:
+            summary = chart_df[col_name].value_counts().reset_index()
+            summary.columns = [col_name, "count"]
+
+            if chart_style == "Horizontal Bar Chart":
+                fig_c = px.bar(
+                    summary.head(10),
+                    x="count",
+                    y=col_name,
+                    orientation="h",
+                    color="count",
+                    color_continuous_scale=["#6ee7b7", "#059669"]
+                )
+                fig_c.update_layout(yaxis=dict(autorange="reversed"))
+                st.plotly_chart(style_plotly_chart(fig_c), use_container_width=True)
+
+            elif chart_style == "Donut Breakdown":
+                fig_c = px.pie(
+                    summary.head(8),
+                    names=col_name,
+                    values="count",
+                    hole=0.45,
+                    color_discrete_sequence=["#059669", "#34d399", "#6ee7b7", "#a7f3d0", "#cbf5dd"]
+                )
+                st.plotly_chart(style_plotly_chart(fig_c), use_container_width=True)
+
+            elif chart_style == "Treemap":
+                fig_c = px.treemap(
+                    summary.head(15),
+                    path=[col_name],
+                    values="count",
+                    color="count",
+                    color_continuous_scale=["#a7f3d0", "#059669"]
+                )
+                st.plotly_chart(style_plotly_chart(fig_c), use_container_width=True)
+
+    # TAB 3: DeepSeek Field Report
+    # TAB 3: DeepSeek Field Report & Q&A
+    with tab_llm:
+        st.subheader("Automated Ecological Intelligence")
+        
+        target_llm_species = st.selectbox("Select Animal for Report:", options=df["common_name"].unique())
+        sub_df = df[df["common_name"] == target_llm_species]
+        
+        # 1. Conservation Brief Button & Output
+        if st.button("Generate Field Assessment", use_container_width=True):
+            top_locs = ", ".join(sub_df["country"].value_counts().head(3).index.tolist())
+            dates = sub_df["event_date"].dropna()
+            date_range = f"{dates.min()[:4]} - {dates.max()[:4]}" if not dates.empty else "N/A"
+            
+            payload = {
+                "total_count": len(sub_df),
+                "top_countries": top_locs if top_locs else "Global Waters / Unassigned",
+                "date_range": date_range
             }
-            with st.spinner("Conservationist is evaluating population patterns..."):
-                try:
-                    report = generate_conservation_report(scientific_name, summary_payload)
-                except Exception as exc:
-                    st.error(f"The AI briefing could not be generated: {exc}")
-                else:
-                    with st.container(border=True):
-                        st.markdown(report)
+            
+            with st.spinner("DeepSeek is evaluating population density and threats..."):
+                report = generate_conservation_report(SPECIES_CATALOG[target_llm_species], payload)
+                st.markdown(f"""
+                <div class="glass-card" style="line-height:1.7; font-size:0.95rem; border-left: 4px solid #059669;">
+                    {report}
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.write("---")
+
+        # 2. Ask Animal Facts / Interactive Q&A
+        st.subheader(f"💬 Ask an Expert About {target_llm_species}")
+        user_query = st.text_input(
+            "Ask anything (diet, behavior, threats, or why they appear in certain locations):",
+            placeholder=f"e.g., Why do {target_llm_species}s thrive in this region?"
+        )
+
+        if st.button("Ask an AI conservationist", use_container_width=False):
+            if user_query.strip():
+                with st.spinner("Consulting ecological records..."):
+                    qa_context = {
+                        "total_count": len(sub_df),
+                        "top_countries": ", ".join(sub_df["country"].value_counts().head(3).index.tolist())
+                    }
+                    answer = answer_animal_question(SPECIES_CATALOG[target_llm_species], user_query, qa_context)
+                    st.markdown(f"""
+                    <div class="glass-card" style="margin-top: 15px; border-left: 4px solid #10b981;">
+                        <strong>Q: {user_query}</strong><br><br>
+                        {answer}
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.warning("Please type a question first.")
+                
 else:
-    st.info(
-        f"No records stored for **{selected_label.split('(')[0].strip()}** yet. Click "
-        "'Ingest GBIF Records to Supabase' in the sidebar to populate it, or switch "
-        "**Map Scope** to 'All stored species' to see whatever is already stored."
-    )
+    st.info("No records are currently loaded in your database for these species. Use the sidebar to fetch initial records from GBIF into Supabase.")
