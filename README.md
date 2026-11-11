@@ -98,8 +98,8 @@ An end-to-end geospatial analytics and ecological intelligence web application. 
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/<your-username>/wildtrack-biodiversity-explorer.git
-   cd wildtrack-biodiversity-explorer
+    git clone https://github.com/Reuelbelizaire/biodiversity_explorer.git
+    cd biodiversity_explorer
    ```
 
 2. **Create and activate a virtual environment:**
