@@ -80,6 +80,65 @@ def resolve_species_name(query_name: str) -> dict | None:
 
     return None
 
+def fetch_animal_photo(scientific_name: str, common_name: str = "") -> str | None:
+    """
+    Fetches a real photo URL of the animal from Wikipedia, automatically
+    skipping range/distribution maps and SVG diagrams.
+    """
+    headers = {"User-Agent": "WildTrackBiodiversityExplorer/1.0 (student-capstone)"}
+    bad_keywords = ["map", "range", "distribution", "area", "cladogram", "diagram", ".svg"]
+
+    def is_valid_photo(url: str) -> bool:
+        if not url:
+            return False
+        low = url.lower()
+        return not any(word in low for word in bad_keywords)
+
+    # 1. Try direct Wikipedia page summary for scientific name, then common name
+    for query in [scientific_name, common_name]:
+        clean = str(query).strip().replace(" ", "_")
+        if not clean:
+            continue
+        try:
+            url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{clean}"
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                for key in ["originalimage", "thumbnail"]:
+                    img_url = data.get(key, {}).get("source")
+                    if is_valid_photo(img_url):
+                        return img_url
+        except Exception:
+            continue
+
+    # 2. Fallback: Search Wikipedia articles (e.g. "Bottlenose dolphin") to get a real photo
+    search_term = common_name if common_name and common_name.lower() != scientific_name.lower() else scientific_name
+    try:
+        search_res = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": f"{search_term} animal",
+                "gsrlimit": 5,
+                "prop": "pageimages",
+                "piprop": "original|thumbnail",
+                "pithumbsize": 800,
+                "format": "json",
+            },
+            headers=headers,
+            timeout=5,
+        ).json()
+
+        pages = search_res.get("query", {}).get("pages", {})
+        for page in pages.values():
+            img_url = page.get("original", {}).get("source") or page.get("thumbnail", {}).get("source")
+            if is_valid_photo(img_url):
+                return img_url
+    except Exception:
+        pass
+
+    return None
 
 def fetch_english_name_and_habitat(scientific_name: str) -> tuple[str, str]:
     """

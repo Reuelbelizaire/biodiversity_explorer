@@ -12,6 +12,7 @@ from gbif_client import (
     fetch_species_occurrences,
     resolve_species_name,
     fetch_english_name_and_habitat,
+    fetch_animal_photo,
 )
 from db_loader import (
     supabase,
@@ -322,39 +323,42 @@ with st.sidebar:
         step=25,
     )
 
+    # Track the last searched term so messages only appear once per new search
+    if "last_checked_query" not in st.session_state:
+        st.session_state.last_checked_query = ""
+
     resolved_info = None
-    if search_query.strip():
-        # Uses your LLM spelling fixer + GBIF taxon resolver
-        corrected_query = check_species_spelling(search_query.strip())
-        if corrected_query.lower() != search_query.strip().lower():
-            st.caption(f"✨ Auto-corrected spelling to: **{corrected_query}**")
+    clean_q = search_query.strip()
 
+    if clean_q:
+        corrected_query = check_species_spelling(clean_q)
         resolved_info = resolve_species_name(corrected_query)
-        if resolved_info:
-            sci = resolved_info.get("scientific_name", corrected_query)
-            st.success(f"✓ Matched GBIF Taxon: **{sci}**")
-        else:
-            st.warning("Couldn't find an exact GBIF match—try the Latin scientific name.")
 
-    if st.button("Ingest Records to Database", use_container_width=True):
-        if not search_query.strip():
-            st.error("Type an animal name first!")
+        # Only show feedback when the user types a NEW search (disappears on tab switches!)
+        if clean_q != st.session_state.last_checked_query:
+            st.session_state.last_checked_query = clean_q
+            if resolved_info:
+                sci = resolved_info.get("scientific_name", corrected_query)
+                st.toast(f"✓ Matched GBIF Taxon: {sci}", icon="🌿")
+            else:
+                st.toast("Animal not found in GBIF — try its scientific name!", icon="⚠️")
+
+    if st.button("➕ Add Your Animal Record to Database", use_container_width=True):
+        if not clean_q:
+            st.toast("Type an animal name first!", icon="⚠️")
+        elif not resolved_info:
+            st.toast("That animal isn't in the GBIF database—try another name!", icon="⚠️")
         else:
-            target_sci = (
-                resolved_info.get("scientific_name")
-                if resolved_info
-                else check_species_spelling(search_query.strip())
-            )
+            target_sci = resolved_info.get("scientific_name")
             with st.spinner(f"Fetching {record_limit} sightings for {target_sci}..."):
                 new_records = fetch_species_occurrences(target_sci, limit=record_limit)
                 if new_records:
                     upsert_occurrences(new_records)
-                    st.cache_data.clear()  # Clear cache so the new animal appears right away
-                    st.success(f"Saved {len(new_records)} records for {target_sci}!")
+                    st.cache_data.clear()
+                    st.toast(f"Added {len(new_records)} records for {target_sci}!", icon="✅")
                     st.rerun()
                 else:
-                    st.warning("No GPS-tagged sightings returned from GBIF for that query.")
-
+                    st.toast("No GPS-tagged sightings found for that animal.", icon="⚠️")
     st.divider()
     st.header("Map & View Filters")
 
@@ -803,57 +807,75 @@ with tab3:
     label_to_common = dict(zip(filtered_df["display_name"], filtered_df["common_name"]))
     species_options = sorted(list(label_to_sci.keys()))
 
-    # Mode 1: 1-10 Trait Radar Chart using generate_species_stats(common_name, scientific_name)
+    # Mode 1: Animal Photo on Left + Signature Trait & 1-10 Progress Breakdown on Right
     if analysis_mode == "🧬 Species Vitality & Trait Ratings (1–10)":
-        target_label = st.selectbox("Select Species for Trait Radar:", species_options)
+        target_label = st.selectbox("Select Species for Trait Profile:", species_options)
         if st.button("Generate Trait Profile"):
             sci_name = label_to_sci[target_label]
             com_name = label_to_common[target_label]
-            with st.spinner(f"Scoring ecological traits for {target_label}..."):
+            with st.spinner(f"Loading field photo and trait ratings for {target_label}..."):
                 stats_dict = generate_species_stats(com_name, sci_name)
+                photo_url = fetch_animal_photo(sci_name, com_name)
 
-                # Extract numeric 1-10 scores from the returned dict
+                # Separate numeric 1-10 scores from text fields (e.g., signature_trait)
                 numeric_traits = {
                     k: float(v)
                     for k, v in stats_dict.items()
                     if isinstance(v, (int, float))
                 }
-                if numeric_traits:
-                    categories = list(numeric_traits.keys())
-                    values = list(numeric_traits.values())
-
-                    fig_radar = go.Figure(
-                        data=go.Scatterpolar(
-                            r=values + [values[0]],
-                            theta=categories + [categories[0]],
-                            fill="toself",
-                            fillcolor="rgba(22, 163, 74, 0.25)",
-                            line=dict(color="#14532d", width=2.5),
-                        )
-                    )
-                    fig_radar.update_layout(
-                        polar=dict(
-                            radialaxis=dict(visible=True, range=[0, 10], color="#052e16"),
-                            bgcolor="rgba(255,255,255,0.8)",
-                        ),
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        font=dict(color="#052e16"),
-                        title=f"Ecological Trait Ratings: {target_label}",
-                    )
-                    st.plotly_chart(fig_radar, use_container_width=True)
-
-                # Display any text summary or signature trait included in the dictionary
                 text_notes = {
-                    k: v for k, v in stats_dict.items() if not isinstance(v, (int, float))
+                    k: str(v)
+                    for k, v in stats_dict.items()
+                    if not isinstance(v, (int, float))
                 }
-                if text_notes:
-                    notes_html = "<br>".join(
-                        [f"<b>{k.replace('_', ' ').title()}:</b> {v}" for k, v in text_notes.items()]
-                    )
+
+                # Grab the signature trait title if present
+                sig_trait = next(iter(text_notes.values()), "Apex Ecological Adaptation")
+
+                # Side-by-side 2-column layout (Animal Photo on left, Signature Card + Bars on right)
+                col_photo, col_breakdown = st.columns([1.05, 1])
+
+                with col_photo:
+                    if photo_url:
+                        st.image(
+                            photo_url,
+                            caption=f"{com_name} ({sci_name})",
+                            use_container_width=True,
+                        )
+                    else:
+                        # Fallback card if Wikipedia doesn't have a photo for that taxon
+                        st.markdown(
+                            f"""
+                            <div class="glass-card-content" style="text-align: center; padding: 60px 20px;">
+                                <div style="font-size: 4rem;">{get_species_emoji(sci_name)}</div>
+                                <div class="kpi-value-sm" style="margin-top: 10px;">{com_name}</div>
+                                <div style="color: #3f624d;"><i>{sci_name}</i></div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                with col_breakdown:
+                    # 1. Top Signature Evolutionary Trait Card
                     st.markdown(
-                        f'<div class="glass-card-content">{notes_html}</div>',
+                        f"""
+                        <div class="glass-card-content" style="margin-bottom: 18px;">
+                            <div class="kpi-title">SIGNATURE EVOLUTIONARY TRAIT</div>
+                            <div class="kpi-value-sm" style="margin: 6px 0;">✨ {sig_trait}</div>
+                            <div style="font-size: 0.88rem; color: #3f624d;">
+                                Taxonomic Target: <i>{sci_name}</i>
+                            </div>
+                        </div>
+                        """,
                         unsafe_allow_html=True,
                     )
+
+                    # 2. Attribute Breakdown (1-10 Scale) with Progress Bars
+                    st.markdown("**Attribute Breakdown (1–10 Scale):**")
+                    for raw_key, score in numeric_traits.items():
+                        clean_label = raw_key.replace("_", " ").title()
+                        st.markdown(f"• **{clean_label}:** `{int(score)}/10`")
+                        st.progress(min(max(score / 10.0, 0.0), 1.0))
 
     # Mode 2: Side-by-Side Comparison using generate_comparative_assessment(...)
     elif analysis_mode == "⚖️ Interspecies Habitat & Range Comparison":
