@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import networkx as nx
 from dotenv import load_dotenv
 
-# Import the exact functions from your helper files
+# Import functions from your helper files
 from gbif_client import (
     fetch_species_occurrences,
     resolve_species_name,
@@ -19,6 +19,7 @@ from db_loader import (
     upsert_occurrences,
     fetch_occurrences_by_species,
     fetch_occurrences_by_species_list,
+    fetch_all_occurrences,
 )
 from llm_service import (
     generate_conservation_report,
@@ -26,6 +27,8 @@ from llm_service import (
     generate_species_stats,
     generate_comparative_assessment,
     check_species_spelling,
+    translate_to_scientific_name,
+    classify_species_diets,
 )
 
 # Load environment variables (.env for local runs)
@@ -272,20 +275,7 @@ def format_species_label(sci_name: str) -> str:
 @st.cache_data(ttl=60)
 def load_all_saved_wildlife() -> pd.DataFrame:
     """Pulls every distinct species and occurrence stored in Supabase."""
-    try:
-        # Query distinct species in the occurrences table first, then load via your helper
-        res = supabase.table("occurrences").select("scientific_name").execute()
-        if not res.data:
-            return pd.DataFrame()
-
-        distinct_sci_names = sorted(
-            list({row["scientific_name"] for row in res.data if row.get("scientific_name")})
-        )
-        records = fetch_occurrences_by_species_list(distinct_sci_names)
-    except Exception:
-        # Fallback direct select if needed
-        res = supabase.table("occurrences").select("*").limit(5000).execute()
-        records = res.data or []
+    records = fetch_all_occurrences()
 
     if not records:
         return pd.DataFrame()
@@ -294,7 +284,6 @@ def load_all_saved_wildlife() -> pd.DataFrame:
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
     df = df.dropna(subset=["latitude", "longitude", "scientific_name"])
-    df["country"] = df["country"].fillna("Unknown").astype(str)
     df["scientific_name"] = df["scientific_name"].astype(str).str.strip()
     df["country"] = df["country"].fillna("Unknown").astype(str).str.strip()
     df["common_name"] = df["scientific_name"].apply(get_common_name)
@@ -302,7 +291,9 @@ def load_all_saved_wildlife() -> pd.DataFrame:
     df["emoji"] = df["scientific_name"].apply(get_species_emoji)
     return df
 
-
+@st.cache_data(ttl=3600)
+def get_cached_diet_roles(species_tuple: tuple[str, ...]) -> dict[str, dict]:
+    return classify_species_diets(list(species_tuple))
 # ==============================================================================
 # 4. SIDEBAR: LIVE GBIF INGESTION & DYNAMIC SPECIES FILTER
 # ==============================================================================
@@ -312,7 +303,7 @@ with st.sidebar:
 
     search_query = st.text_input(
         "🔍 Search Any Animal:",
-        placeholder="e.g., Danaus plexippus, Cheetah, Lynx",
+        placeholder="e.g., Aardvark, Cheetah, Danaus plexippus",
     )
 
     record_limit = st.slider(
@@ -323,42 +314,67 @@ with st.sidebar:
         step=25,
     )
 
-    # Track the last searched term so messages only appear once per new search
-    if "last_checked_query" not in st.session_state:
-        st.session_state.last_checked_query = ""
+    # Track search & warning states so notifications clear automatically on tab switches
+    if "last_failed_query" not in st.session_state:
+        st.session_state.last_failed_query = ""
+    if "no_records_msg" not in st.session_state:
+        st.session_state.no_records_msg = ""
 
     resolved_info = None
     clean_q = search_query.strip()
 
+    # Clear the "no records" warning automatically if the user changes the search text
+    if clean_q != st.session_state.get("last_searched_for_records", ""):
+        st.session_state.no_records_msg = ""
+
     if clean_q:
         corrected_query = check_species_spelling(clean_q)
+        # First try GBIF directly; if not found, auto-translate to Latin scientific name and retry
         resolved_info = resolve_species_name(corrected_query)
+        if not resolved_info:
+            auto_sci = translate_to_scientific_name(corrected_query)
+            if auto_sci:
+                resolved_info = resolve_species_name(corrected_query, fallback_sci_name=auto_sci)
 
-        # Only show feedback when the user types a NEW search (disappears on tab switches!)
-        if clean_q != st.session_state.last_checked_query:
-            st.session_state.last_checked_query = clean_q
-            if resolved_info:
-                sci = resolved_info.get("scientific_name", corrected_query)
-                st.toast(f"✓ Matched GBIF Taxon: {sci}", icon="🌿")
-            else:
-                st.toast("Animal not found in GBIF — try its scientific name!", icon="⚠️")
+        if resolved_info:
+            sci = resolved_info.get("scientific_name", corrected_query)
+            fam = resolved_info.get("family", "Unknown")
+            st.success(f"✓ Matched GBIF Taxon ({fam}):")
+            st.code(sci, language=None)
+            st.session_state.last_failed_query = ""
+        else:
+            if clean_q != st.session_state.last_failed_query:
+                st.session_state.last_failed_query = clean_q
+                st.toast(f"'{clean_q}' couldn't be found within GBIF.", icon="⚠️")
 
     if st.button("➕ Add Your Animal Record to Database", use_container_width=True):
+        st.session_state.last_searched_for_records = clean_q
         if not clean_q:
             st.toast("Type an animal name first!", icon="⚠️")
         elif not resolved_info:
-            st.toast("That animal isn't in the GBIF database—try another name!", icon="⚠️")
+            st.session_state.no_records_msg = f"Sorry, we couldn't find '{clean_q}' within GBIF."
         else:
             target_sci = resolved_info.get("scientific_name")
+            target_key = resolved_info.get("taxon_key")
             with st.spinner(f"Fetching {record_limit} sightings for {target_sci}..."):
-                new_records = fetch_species_occurrences(target_sci, limit=record_limit)
+                new_records = fetch_species_occurrences(
+                    target_sci, limit=record_limit, taxon_key=target_key
+                )
                 if new_records:
+                    st.session_state.no_records_msg = ""
                     upsert_occurrences(new_records)
                     st.cache_data.clear()
                     st.toast(f"Added {len(new_records)} records for {target_sci}!", icon="✅")
                     st.rerun()
                 else:
-                    st.toast("No GPS-tagged sightings found for that animal.", icon="⚠️")
+                    st.session_state.no_records_msg = (
+                        f"Sorry, we couldn't find any GPS-tagged records for **{target_sci}** in GBIF."
+                    )
+
+    if st.session_state.no_records_msg:
+        st.warning(st.session_state.no_records_msg)
+        st.session_state.no_records_msg = ""
+
     st.divider()
     st.header("Map & View Filters")
 
@@ -620,7 +636,8 @@ with tab2:
         "Choose Visualization:",
         [
             "📅 12-Month Observation & Seasonality Matrix",
-            "🕸️ Food Web & Ecosystem Links",
+            "🌿 Biome & Habitat Distribution",
+            "🥩 Trophic Diet & Food Roles",
             "📈 Population & Latitudinal Distributions",
         ],
         horizontal=True,
@@ -669,81 +686,169 @@ with tab2:
         else:
             st.warning("No `event_date` column found in the dataset.")
 
-    # 2. NetworkX Ecological Food Web
-    elif chart_choice == "🕸️ Food Web & Ecosystem Links":
-        G = nx.DiGraph()
-        active_sp = filtered_df["display_name"].unique().tolist()
+# 2A. Dynamic Biome & Habitat Distribution (Side-by-Side: Chart + Visual Habitat Cards)
+    elif chart_choice == "🌿 Biome & Habitat Distribution":
+        def classify_dynamic_biome(row) -> str:
+            abs_lat = abs(row["avg_lat"])
+            emoji = str(row["emoji"])
 
-        for sp in active_sp:
-            G.add_node(sp, role="Tracked Species")
+            if "🌊" in emoji:
+                return "Polar & Subpolar Seas" if abs_lat >= 55 else "Temperate & Tropical Oceans"
+            if "🪽" in emoji:
+                return "Boreal & Temperate Flyways" if abs_lat >= 45 else "Tropical & Migratory Flyways"
 
-        biome_links = {
-            "Cheetah": "African Savanna",
-            "Giraffe": "African Savanna",
-            "African Lion": "African Savanna",
-            "Emperor Penguin": "Southern Ocean / Antarctica",
-            "Blue Whale": "Pelagic Oceans",
-            "Komodo Dragon": "Indonesian Islands",
-            "Monarch Butterfly": "North American Flyway",
-            "Peregrine Falcon": "Global Skies / Cliffs",
-        }
+            if abs_lat >= 55:
+                return "Arctic Tundra & Boreal"
+            elif abs_lat >= 23.5:
+                return "Temperate Grasslands & Forests"
+            else:
+                return "Tropical Savannas & Rainforests"
 
-        for sp in active_sp:
-            matched_biome = "Global Biosphere"
-            for key, biome in biome_links.items():
-                if key in sp:
-                    matched_biome = biome
-                    break
-            G.add_node(matched_biome, role="Biome")
-            G.add_edge(sp, matched_biome)
+        biome_df = (
+            filtered_df.groupby(["display_name", "scientific_name", "emoji"], as_index=False)
+            .agg(
+                sightings=("latitude", "count"),
+                avg_lat=("latitude", "mean"),
+                top_country=("country", lambda s: s.mode().iloc[0] if not s.mode().empty else "Global"),
+            )
+        )
+        biome_df["biome"] = biome_df.apply(classify_dynamic_biome, axis=1)
+        biome_df["short_label"] = biome_df["display_name"].apply(lambda s: s.split(" (")[0])
 
-        pos = nx.spring_layout(G, seed=42, k=0.9)
-        edge_x, edge_y = [], []
-        for u, v in G.edges():
-            x0, y0 = pos[u]
-            x1, y1 = pos[v]
-            edge_x.extend([x0, x1, None])
-            edge_y.extend([y0, y1, None])
+        col_chart, col_cards = st.columns([1.4, 1], gap="large")
 
-        edge_trace = go.Scatter(
-            x=edge_x,
-            y=edge_y,
-            line=dict(width=2, color="#86efac"),
-            hoverinfo="none",
-            mode="lines",
+        with col_chart:
+            fig_biome = px.treemap(
+                biome_df,
+                path=["biome", "short_label"],
+                values="sightings",
+                color="biome",
+                maxdepth=2,
+                custom_data=["display_name"],
+                title="Dynamic Species-to-Biome Habitat Distribution (Click to Zoom)",
+                color_discrete_sequence=["#14532d", "#166534", "#0f766e", "#15803d", "#047857"],
+            )
+            fig_biome.update_traces(
+                textinfo="label+value+percent parent",
+                textfont=dict(family="Inter, Segoe UI, Arial, sans-serif", size=15, color="#ffffff"),
+                marker=dict(line=dict(color="#e8ece9", width=3)),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Active Sightings: %{value}<br>"
+                    "Share of Biome: %{percentParent:.1%}<extra></extra>"
+                ),
+            )
+            fig_biome.update_layout(
+                margin=dict(t=50, l=5, r=5, b=5),
+                height=560,
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="Inter, Segoe UI, Arial, sans-serif", color="#052e16", size=14),
+            )
+            st.plotly_chart(fig_biome, use_container_width=True)
+
+        with col_cards:
+            st.markdown("#### 🌍 Species Biome & Habitat Roster")
+            selected_biome = st.selectbox(
+                "Filter roster by ecological biome:",
+                ["All Biomes"] + sorted(biome_df["biome"].unique().tolist()),
+                key="biome_roster_filter",
+            )
+            roster_df = (
+                biome_df
+                if selected_biome == "All Biomes"
+                else biome_df[biome_df["biome"] == selected_biome]
+            )
+
+            with st.container(height=470):
+                for _, row in roster_df.iterrows():
+                    photo_url = fetch_animal_photo(row["scientific_name"])
+                    hemisphere = "N" if row["avg_lat"] >= 0 else "S"
+                    c_img, c_txt = st.columns([1, 2.2])
+                    with c_img:
+                        if photo_url:
+                            st.image(photo_url, use_container_width=True)
+                    with c_txt:
+                        st.markdown(f"**{row['short_label']}** · `{row['biome']}`")
+                        st.caption(
+                            f"📍 **Top Hotspot:** {row['top_country']} ({abs(row['avg_lat']):.1f}°{hemisphere}) · "
+                            f"**{row['sightings']}** sightings"
+                        )
+                    st.divider()
+
+# 2B. AI-Classified Trophic Diet & Food Roles (Side-by-Side: Chart + Visual Prey Cards)
+    elif chart_choice == "🥩 Trophic Diet & Food Roles":
+        diet_df = (
+            filtered_df.groupby(["display_name", "scientific_name"], as_index=False)
+            .size()
+            .rename(columns={"size": "sightings"})
+        )
+        diet_df["short_label"] = diet_df["display_name"].apply(lambda s: s.split(" (")[0])
+
+        with st.spinner("Classifying ecological diet roles..."):
+            diet_map = get_cached_diet_roles(tuple(sorted(diet_df["short_label"].unique())))
+
+        diet_df["trophic_role"] = diet_df["short_label"].apply(
+            lambda x: diet_map.get(x, {}).get("role", "Omnivore")
+        )
+        diet_df["primary_diet"] = diet_df["short_label"].apply(
+            lambda x: diet_map.get(x, {}).get("diet", "Varied natural diet")
         )
 
-        node_x, node_y, node_text, node_colors = [], [], [], []
-        for node, attrs in G.nodes(data=True):
-            x, y = pos[node]
-            node_x.append(x)
-            node_y.append(y)
-            node_text.append(node)
-            node_colors.append("#14532d" if attrs.get("role") == "Tracked Species" else "#16a34a")
+        col_chart, col_cards = st.columns([1.4, 1], gap="large")
 
-        node_trace = go.Scatter(
-            x=node_x,
-            y=node_y,
-            mode="markers+text",
-            text=node_text,
-            textposition="top center",
-            textfont=dict(color="#052e16", size=12),
-            marker=dict(size=22, color=node_colors, line=dict(width=2, color="#ffffff")),
-            hoverinfo="text",
-        )
+        with col_chart:
+            fig_diet = px.treemap(
+                diet_df,
+                path=["trophic_role", "short_label"],
+                values="sightings",
+                color="trophic_role",
+                maxdepth=2,
+                custom_data=["display_name", "primary_diet"],
+                title="Trophic Diet & Ecological Food Roles (Click to Zoom)",
+                color_discrete_sequence=["#7f1d1d", "#9a3412", "#14532d", "#0f766e", "#1d4ed8"],
+            )
+            fig_diet.update_traces(
+                textinfo="label+value",
+                textfont=dict(family="Inter, Segoe UI, Arial, sans-serif", size=15, color="#ffffff"),
+                marker=dict(line=dict(color="#e8ece9", width=3)),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Primary Diet: %{customdata[1]}<br>"
+                    "Active Sightings: %{value}<extra></extra>"
+                ),
+            )
+            fig_diet.update_layout(
+                margin=dict(t=50, l=5, r=5, b=5),
+                height=560,
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="Inter, Segoe UI, Arial, sans-serif", color="#052e16", size=14),
+            )
+            st.plotly_chart(fig_diet, use_container_width=True)
 
-        fig_web = go.Figure(data=[edge_trace, node_trace])
-        fig_web.update_layout(
-            title="Species-to-Biome Ecological Network",
-            showlegend=False,
-            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#052e16"),
-            height=450,
-        )
-        st.plotly_chart(fig_web, use_container_width=True)
+        with col_cards:
+            st.markdown("#### 🍽️ Species Diet & Prey Roster")
+            selected_role = st.selectbox(
+                "Filter roster by trophic group:",
+                ["All Roles"] + sorted(diet_df["trophic_role"].unique().tolist()),
+                key="diet_role_filter",
+            )
+            roster_df = (
+                diet_df
+                if selected_role == "All Roles"
+                else diet_df[diet_df["trophic_role"] == selected_role]
+            )
+
+            with st.container(height=470):
+                for _, row in roster_df.iterrows():
+                    photo_url = fetch_animal_photo(row["scientific_name"])
+                    c_img, c_txt = st.columns([1, 2.2])
+                    with c_img:
+                        if photo_url:
+                            st.image(photo_url, use_container_width=True)
+                    with c_txt:
+                        st.markdown(f"**{row['short_label']}** · `{row['trophic_role']}`")
+                        st.caption(f"🥗 **Eats:** {row['primary_diet']} ({row['sightings']} sightings)")
+                    st.divider()
 
     # 3. Population Counts & Latitudinal Distribution
     else:

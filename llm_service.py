@@ -126,3 +126,56 @@ def check_species_spelling(query: str) -> str:
         return response.choices[0].message.content.strip()
     except Exception:
         return query
+    
+def translate_to_scientific_name(animal_query: str) -> str | None:
+    """Uses the LLM to convert a regular English animal name into its Latin scientific name."""
+    prompt = (
+        f"What is the exact Latin binomial scientific name for the animal '{animal_query}'? "
+        "Reply ONLY with the two-word Latin scientific name (e.g., Orycteropus afer). "
+        "If it is not a real animal, reply ONLY with UNKNOWN."
+    )
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=20,
+        )
+        result = response.choices[0].message.content.strip().strip('"').strip("'")
+        if not result or "UNKNOWN" in result.upper() or len(result.split()) > 4:
+            return None
+        return result
+    except Exception:
+        return None
+
+def classify_species_diets(species_list: list[str]) -> dict[str, dict]:
+    """
+    Classifies a list of species into their primary trophic diet role and primary prey/food source
+    in a single LLM call so it can be cached cleanly by Streamlit.
+    """
+    if not species_list:
+        return {}
+
+    prompt = (
+        "For each animal in this list, identify its primary trophic diet role "
+        "(choose strictly one: 'Apex Carnivore', 'Carnivore', 'Herbivore', 'Omnivore', or 'Insectivore & Nectarivore') "
+        "and a short 3-5 word summary of its main diet.\n"
+        f"Animals: {species_list}\n"
+        'Return ONLY valid JSON mapping each exact animal string from the list to '
+        '{"role": "...", "diet": "..."}. No markdown or extra text.'
+    )
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=600,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception:
+        return {}

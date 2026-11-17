@@ -1,18 +1,23 @@
 import requests
 
 
-def fetch_species_occurrences(scientific_name: str, limit: int = 150) -> list[dict]:
+def fetch_species_occurrences(
+    scientific_name: str, limit: int = 150, taxon_key: int | None = None
+) -> list[dict]:
     """
-    Fetches raw occurrence data from the GBIF REST API for a given species,
+    Fetches raw occurrence data from the GBIF REST API for a given species or taxonKey,
     cleans missing coordinates, and standardizes field names.
     """
     endpoint = "https://api.gbif.org/v1/occurrence/search"
     params = {
-        "scientificName": scientific_name,
         "hasCoordinate": "true",
         "hasGeospatialIssue": "false",
         "limit": limit,
     }
+    if taxon_key:
+        params["taxonKey"] = taxon_key
+    else:
+        params["scientificName"] = scientific_name
 
     try:
         response = requests.get(endpoint, params=params, timeout=10)
@@ -25,11 +30,10 @@ def fetch_species_occurrences(scientific_name: str, limit: int = 150) -> list[di
 
     cleaned_records = []
     for item in raw_results:
-        # Standardize and map directly to Supabase schema
         cleaned_records.append(
             {
                 "occurrence_id": str(item.get("key")),
-                "scientific_name": scientific_name,  # Clean canonical name without author tags
+                "scientific_name": scientific_name,
                 "country": item.get("country", "Unknown"),
                 "latitude": item.get("decimalLatitude"),
                 "longitude": item.get("decimalLongitude"),
@@ -40,43 +44,48 @@ def fetch_species_occurrences(scientific_name: str, limit: int = 150) -> list[di
 
     return cleaned_records
 
-
-def resolve_species_name(query_name: str) -> dict | None:
+def resolve_species_name(query_name: str, fallback_sci_name: str | None = None) -> dict | None:
     """
     Resolves common or scientific names via GBIF Taxonomy & Suggest APIs.
+    If the regular English name (e.g., 'aardvark') isn't matched directly by GBIF,
+    automatically retries using fallback_sci_name (e.g., 'Orycteropus afer').
     """
-    cleaned_query = query_name.strip()
+    candidates = [query_name.strip()]
+    if fallback_sci_name and fallback_sci_name.strip().lower() != query_name.strip().lower():
+        candidates.append(fallback_sci_name.strip())
 
-    # 1. First attempt: Standard scientific / taxonomic matcher
-    match_url = f"https://api.gbif.org/v1/species/match?verbose=false&name={cleaned_query}"
-    try:
-        res = requests.get(match_url, timeout=5).json()
-        match_type = res.get("matchType")
-        if match_type in ["EXACT", "FUZZY"] and res.get("confidence", 0) > 60:
-            return {
-                "scientific_name": res.get("species") or res.get("scientificName"),
-                "canonical_name": res.get("canonicalName") or res.get("species"),
-                "family": res.get("family", "Unknown"),
-                "taxon_key": res.get("usageKey"),
-            }
-    except Exception as e:
-        print(f"Error in GBIF species match: {e}")
+    for candidate in candidates:
+        # 1. Standard scientific / taxonomic matcher
+        match_url = f"https://api.gbif.org/v1/species/match?verbose=false&name={candidate}"
+        try:
+            res = requests.get(match_url, timeout=5).json()
+            match_type = res.get("matchType")
+            if match_type in ["EXACT", "FUZZY"] and res.get("confidence", 0) > 60:
+                sci = res.get("species") or res.get("canonicalName") or res.get("scientificName")
+                if sci:
+                    return {
+                        "scientific_name": sci,
+                        "canonical_name": res.get("canonicalName") or sci,
+                        "family": res.get("family", "Unknown"),
+                        "taxon_key": res.get("usageKey"),
+                    }
+        except Exception as e:
+            print(f"Error in GBIF species match: {e}")
 
-    # 2. Fallback: Search endpoint (resolves vernacular / common names like 'Jaguar')
-    suggest_url = f"https://api.gbif.org/v1/species/suggest?q={cleaned_query}&limit=5"
-    try:
-        suggestions = requests.get(suggest_url, timeout=5).json()
-        for item in suggestions:
-            # Look for species-rank results
-            if item.get("rank") == "SPECIES" and item.get("canonicalName"):
-                return {
-                    "scientific_name": item.get("canonicalName"),
-                    "canonical_name": item.get("canonicalName"),
-                    "family": item.get("family", "Unknown"),
-                    "taxon_key": item.get("key"),
-                }
-    except Exception as e:
-        print(f"Error in GBIF species suggest: {e}")
+        # 2. Suggest endpoint fallback
+        suggest_url = f"https://api.gbif.org/v1/species/suggest?q={candidate}&limit=5"
+        try:
+            suggestions = requests.get(suggest_url, timeout=5).json()
+            for item in suggestions:
+                if item.get("rank") in ["SPECIES", "GENUS", "FAMILY"] and item.get("canonicalName"):
+                    return {
+                        "scientific_name": item.get("canonicalName"),
+                        "canonical_name": item.get("canonicalName"),
+                        "family": item.get("family", "Unknown"),
+                        "taxon_key": item.get("key"),
+                    }
+        except Exception as e:
+            print(f"Error in GBIF species suggest: {e}")
 
     return None
 
