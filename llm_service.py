@@ -13,67 +13,69 @@ client = OpenAI(
 )
 
 def generate_conservation_report(scientific_name: str, payload: dict) -> str:
+    """Generates a tight 3-bullet conservation briefing (~60 words max)."""
     prompt = f"""
-    You are an expert wildlife ecologist. Provide an executive conservation briefing for:
-    - Species: {scientific_name}
-    - Total Monitored Sightings: {payload.get('total_count')}
-    - Key Observation Locations: {payload.get('top_countries')}
-    - Date Range: {payload.get('date_range')}
+You are a concise wildlife telemetry analyst writing a field card for {scientific_name}.
+Context: {payload.get('total_count')} sightings | Locations: {payload.get('top_countries')} | Period: {payload.get('date_range')}.
 
-    Keep it concise, rigorous, and structured in 3 paragraphs:
-    1. Geographic footprint and current habitat dynamics.
-    2. Primary environmental and anthropogenic threats.
-    3. Actionable conservation priorities.
-    """
+Write ONLY these 3 bullet points (MAX 18 words per bullet, NO intro or outro paragraphs):
+- **Habitat & Footprint:** [Key biome + alignment with {payload.get('top_countries')}]
+- **Primary Threat:** [Main environmental or human threat]
+- **Conservation Priority:** [IUCN status + 1 concrete protection action]
+"""
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=600,
-            temperature=0.3
+            max_tokens=160,
+            temperature=0.2
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"Assessment generation unavailable: {str(e)}"
+        return f"- **Assessment Unavailable:** {str(e)}"
 
 def answer_animal_question(scientific_name: str, question: str, context: dict) -> str:
+    """Answers user wildlife questions in 2-3 punchy bullets (under 75 words total)."""
     prompt = f"""
-    You are a wildlife expert. Answer this question regarding {scientific_name}:
-    Context: {context.get('total_count')} observations recorded across {context.get('top_countries')}.
-    Question: {question}
-    Provide a factual, engaging answer in 2-3 short paragraphs.
-    """
+You are a concise wildlife expert answering a question about {scientific_name}.
+Context: {context.get('total_count')} observations across {context.get('top_countries')}.
+Question: {question}
+
+Rules:
+- Reply in 2 to 3 short bullet points ONLY (MAX 75 words total).
+- Start directly with the answer—no introductory fluff or filler.
+"""
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
-            temperature=0.4
+            max_tokens=140,
+            temperature=0.3
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"Unable to retrieve answer: {str(e)}"
+        return f"- **Unable to retrieve answer:** {str(e)}"
 
 def generate_species_stats(common_name: str, scientific_name: str) -> dict:
-    """Generates numerical 1-10 attributes and a signature skill for radar charts."""
+    """Generates numerical 1-10 attributes and a 2-4 word signature skill."""
     prompt = f"""
-    Provide realistic biological RPG-style stat ratings on a strict 1 to 10 scale for the animal '{common_name}' ({scientific_name}).
-    Return ONLY a valid JSON object with these exact keys:
-    {{
-        "strength": <integer 1-10>,
-        "speed": <integer 1-10>,
-        "endurance": <integer 1-10>,
-        "stealth": <integer 1-10>,
-        "threat_level": <integer 1-10>,
-        "signature_skill": "<Short description of primary evolutionary ability, e.g., Burst Acceleration>"
-    }}
-    Do not include markdown fences, thoughts, or extra commentary. Output strictly JSON.
-    """
+Provide realistic biological stat ratings on a strict 1 to 10 scale for '{common_name}' ({scientific_name}).
+Return ONLY a valid JSON object with these exact keys:
+{{
+    "strength": <integer 1-10>,
+    "speed": <integer 1-10>,
+    "endurance": <integer 1-10>,
+    "stealth": <integer 1-10>,
+    "threat_level": <integer 1-10>,
+    "signature_skill": "<2 to 4 word evolutionary ability, e.g., Burst Acceleration>"
+}}
+Output strictly JSON. No markdown fences or extra commentary.
+"""
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
+            max_tokens=120,
             temperature=0.2
         )
         raw = response.choices[0].message.content.strip().replace("```json", "").replace("```", "")
@@ -85,54 +87,54 @@ def generate_species_stats(common_name: str, scientific_name: str) -> dict:
         }
 
 def generate_comparative_assessment(spec_a: str, spec_b: str, summary_a: dict, summary_b: dict) -> str:
-    """Compares ecological footprints and vulnerability between two species."""
+    """Compares two species in 3 crisp bullets (~75 words max, down from 1500 tokens)."""
     prompt = f"""
-    Compare the following two species based on their ecological footprints and monitoring data:
-    Species A: {spec_a} ({summary_a.get('count')} observations, primarily in {summary_a.get('top_loc')})
-    Species B: {spec_b} ({summary_b.get('count')} observations, primarily in {summary_b.get('top_loc')})
+Compare these two species based on their monitoring data:
+- Species A: {spec_a} ({summary_a.get('count')} sightings, primarily in {summary_a.get('top_loc')})
+- Species B: {spec_b} ({summary_b.get('count')} sightings, primarily in {summary_b.get('top_loc')})
 
-    Deliver a structured 3-part comparative assessment:
-    1. Trophic & Niche Comparison (Predator vs. Herbivore, marine vs. terrestrial).
-    2. Range Resilience & Habitat Pressures (Which species faces greater immediate geographic fragmentation).
-    3. Synergistic Conservation Recommendation.
-    """
+Deliver ONLY these 3 short bullet points (MAX 22 words per bullet, NO intro/outro text):
+- **Niche & Diet Contrast:** [Compare trophic role and habitat type]
+- **Range Vulnerability:** [State which species faces tighter geographic fragmentation and why]
+- **Conservation Takeaway:** [1 shared or targeted protection priority]
+"""
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
-            temperature=0.3
+            max_tokens=180,
+            temperature=0.2
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"Comparative assessment unavailable: {str(e)}"
+        return f"- **Comparative Assessment Unavailable:** {str(e)}"
 
 def check_species_spelling(query: str) -> str:
-    """Interprets misspelled animal queries and returns the corrected common/binomial name."""
+    """Interprets misspelled animal queries and returns Common Name (Scientific Name)."""
     prompt = f"""
-    The user entered an animal search query: '{query}'.
-    If it is misspelled or colloquial, identify the intended real animal common name and scientific binomial.
-    Reply with ONLY the format: Common Name (Scientific Name).
-    Example: 'cheta' -> 'Cheetah (Acinonyx jubatus)'.
-    If the name is already valid or unrecognizable, return the best standard match. Do not explain.
-    """
+The user entered an animal search query: '{query}'.
+If misspelled or colloquial, identify the intended real animal common name and scientific binomial.
+Reply with ONLY the format: Common Name (Scientific Name).
+Example: 'cheta' -> 'Cheetah (Acinonyx jubatus)'.
+Do not explain.
+"""
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=40,
+            max_tokens=30,
             temperature=0.1
         )
         return response.choices[0].message.content.strip()
     except Exception:
         return query
-    
+
 def translate_to_scientific_name(animal_query: str) -> str | None:
-    """Uses the LLM to convert a regular English animal name into its Latin scientific name."""
+    """Converts a regular English animal name into its Latin scientific name."""
     prompt = (
-        f"What is the exact Latin binomial scientific name for the animal '{animal_query}'? "
+        f"What is the exact Latin binomial scientific name for '{animal_query}'? "
         "Reply ONLY with the two-word Latin scientific name (e.g., Orycteropus afer). "
-        "If it is not a real animal, reply ONLY with UNKNOWN."
+        "If not a real animal, reply ONLY with UNKNOWN."
     )
     try:
         response = client.chat.completions.create(
@@ -149,17 +151,14 @@ def translate_to_scientific_name(animal_query: str) -> str | None:
         return None
 
 def classify_species_diets(species_list: list[str]) -> dict[str, dict]:
-    """
-    Classifies a list of species into their primary trophic diet role and primary prey/food source
-    in a single LLM call so it can be cached cleanly by Streamlit.
-    """
+    """Classifies species into trophic diet roles with a strict 3-5 word diet summary."""
     if not species_list:
         return {}
 
     prompt = (
         "For each animal in this list, identify its primary trophic diet role "
         "(choose strictly one: 'Apex Carnivore', 'Carnivore', 'Herbivore', 'Omnivore', or 'Insectivore & Nectarivore') "
-        "and a short 3-5 word summary of its main diet.\n"
+        "and a strict 3-5 word summary of its main diet.\n"
         f"Animals: {species_list}\n"
         'Return ONLY valid JSON mapping each exact animal string from the list to '
         '{"role": "...", "diet": "..."}. No markdown or extra text.'
@@ -169,7 +168,7 @@ def classify_species_diets(species_list: list[str]) -> dict[str, dict]:
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=600,
+            max_tokens=500,
         )
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
